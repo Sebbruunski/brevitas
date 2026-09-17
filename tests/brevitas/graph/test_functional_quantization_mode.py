@@ -11,6 +11,7 @@ from torch.nn.utils.parametrize import register_parametrization
 from torch.utils.checkpoint import checkpoint
 
 from brevitas.graph.functional_quant import grouped_mm_functions
+from brevitas.graph.functional_quant import ParameterViewQuant
 from brevitas.graph.quantize import _QuantParametrization
 from brevitas.graph.quantize import functional_quantization_mode
 from brevitas.graph.quantize import prepare_functional_quantization
@@ -173,6 +174,17 @@ class GroupedFunctionalWeightModel(nn.Module):
         return self.grouped_mm(x, self.weight.transpose(-2, -1), offs=offsets)
 
 
+class GatheredFunctionalWeightModel(nn.Module):
+    """Batched-MM style expert gather from one stacked parameter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(3, 3, 4))
+
+    def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
+        return torch.bmm(self.weight[expert_ids], x.unsqueeze(-1)).squeeze(-1)
+
+
 class UnsupportedFunctionalWeightViewModel(nn.Module):
     """Functional linear model using a non-leading-index parameter view."""
 
@@ -283,6 +295,33 @@ class CheckpointedTwoLinearModel(nn.Module):
 @requires_pt_ge('1.12')
 class TestFunctionalQuantizationMode:
 
+    def test_parameter_view_quantizes_selected_expert_only(self):
+        model = StackedFunctionalWeightModel()
+        model.weight.data[0].fill_(0.01)
+        model.weight.data[1].fill_(100.)
+        spec = ParameterViewQuant(Int8WeightPerTensorFloat, selector_dim=0)
+        state = prepare_functional_quantization(
+            model, {F.linear: (None, None, spec)}, example_inputs=(torch.randn(2, 4), 0))
+        assert len(state.parameter_view_quantizers) == 1
+        keys = next(iter(state.parameter_view_quantizers.values()))[2]
+        assert len(keys) == 2
+        assert not is_parametrized(model, 'weight')
+        with functional_quantization_mode(state):
+            output = model(torch.randn(2, 4), 1)
+        assert output.shape == (2, 3)
+        state.cleanup()
+
+    def test_parameter_view_quantizes_vector_expert_gather(self):
+        model = GatheredFunctionalWeightModel()
+        spec = ParameterViewQuant(Int8WeightPerTensorFloat, selector_dim=0)
+        quant_map = {torch.bmm: (None, None, spec)}
+        state = prepare_functional_quantization(
+            model, quant_map, example_inputs=(torch.randn(2, 4), torch.tensor([0, 2])))
+        with functional_quantization_mode(state):
+            output = model(torch.randn(2, 4), torch.tensor([2, 1]))
+        assert output.shape == (2, 3)
+        state.cleanup()
+
     def test_input_only_skips_parameter_derived_weight_view(self):
         """A missing second spec does not quantize a parameter-derived view."""
         model = StackedFunctionalWeightModel()
@@ -345,6 +384,27 @@ class TestFunctionalQuantizationMode:
             output.float().sum().backward()
 
         assert model.parametrizations.weight.original.grad is not None
+        state.cleanup()
+
+    @pytest.mark.skipif(not hasattr(torch, '_grouped_mm'), reason='Torch grouped_mm is unavailable')
+    def test_parameter_view_quantizes_full_grouped_expert_bank(self):
+        model = GroupedFunctionalWeightModel()
+        grouped_mm = next(func for func in grouped_mm_functions() if func is torch._grouped_mm)
+        spec = ParameterViewQuant(
+            Int8WeightPerTensorFloat,
+            selector_dim=0,
+            kwargs={
+                'output_channel_dim': 1, 'group_dim': 2})
+        state = prepare_functional_quantization(
+            model, {grouped_mm: (None, None, spec)},
+            example_inputs=(
+                torch.randn(4, 256, dtype=torch.bfloat16), torch.tensor([2, 4], dtype=torch.int32)))
+        assert len(next(iter(state.parameter_view_quantizers.values()))[2]) == 2
+        assert not is_parametrized(model, 'weight')
+        with functional_quantization_mode(state):
+            output = model(
+                torch.randn(4, 256, dtype=torch.bfloat16), torch.tensor([2, 4], dtype=torch.int32))
+        assert output.shape == (4, 64)
         state.cleanup()
 
     def test_grouped_mm_transformers_fallback_alias(self):

@@ -5,6 +5,7 @@ from collections import defaultdict
 import contextlib
 from dataclasses import dataclass
 from dataclasses import field
+import operator
 from typing import Any
 from typing import Callable
 from typing import Dict
@@ -14,6 +15,7 @@ from typing import Tuple
 from typing import Type
 from typing import Union
 import warnings
+import weakref
 
 from packaging import version
 import torch
@@ -28,12 +30,14 @@ from torch.utils.hooks import RemovableHandle
 
 from brevitas import torch_version
 from brevitas.nn import QuantIdentity
+from brevitas.quant_tensor import _unpack_quant_tensor
 from brevitas.quant_tensor import QuantTensor
 
 # Runtime quantization for calls to torch functional operators.
 
 __all__ = [
     'FunctionalQuantState',
+    'ParameterViewQuant',
     'functional_quantization_mode',
     'grouped_mm_functions',
     'prepare_functional_quantization',
@@ -44,6 +48,34 @@ QuantResolver = Callable[[nn.Module, str, int], QuantResolverResult]
 QuantResolvable = Optional[Union[Type, QuantResolver]]
 QuantSpecElement = Union[QuantResolvable, Tuple[QuantResolvable, Dict[str, Any]]]
 QuantSpecType = Union[QuantSpecElement, Tuple[QuantSpecElement, ...]]
+
+
+@dataclass(frozen=True)
+class ParameterViewQuant:
+    """Quantize independently selected views of one parameter.
+
+    ``selector_dim`` is relative to the original parameter. The first version
+    supports scalar/vector indexing of that dimension and an optional final-two
+    axis transpose, matching eager, batched, and grouped MoE weight access.
+    """
+
+    quantizer: Type
+    selector_dim: int
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ParameterView:
+    owner: Tuple[nn.Module, str]
+    selector_dim: Optional[int] = None
+    selector: Any = None
+    transpose_last_two: bool = False
+    direct: bool = True
+    reason: Optional[str] = None
+
+
+_SELECT_FUNCTIONS = (operator.getitem, torch.Tensor.__getitem__)
+_TRANSPOSE_FUNCTIONS = (torch.transpose, torch.Tensor.transpose)
 
 
 def _grouped_mm_key(*args, **kwargs):
@@ -194,7 +226,7 @@ def _logical_arguments(
 class _WeightQuantHolder(nn.Module):
     """Adapter exposing explicitly configured operation metadata to weight solvers."""
 
-    def __init__(self, weight: nn.Parameter, output_channel_dim: int) -> None:
+    def __init__(self, weight: Tensor, output_channel_dim: int) -> None:
         """Expose a weight and explicit output channel dimension to a proxy."""
         super().__init__()
         self.weight = weight
@@ -236,6 +268,8 @@ class _DiscoveredArgument:
     fallback_quant_class: Optional[Type] = None
     fallback_di_kwargs: Dict[str, Any] = field(default_factory=dict)
     example_device: Optional[torch.device] = None
+    parameter_view_quant: Optional[ParameterViewQuant] = None
+    parameter_view_selector_dim: Optional[int] = None
 
 
 @dataclass
@@ -260,6 +294,10 @@ class FunctionalQuantState:
         self.specs = _parse_quant_map(quant_map)
         self.function_indices = {func: index for index, func in enumerate(self.specs)}
         self.calls: Dict[Tuple[str, Callable, int], _PreparedCall] = {}
+        # (call key, argument index) -> (owner, selector dimension, proxy keys)
+        self.parameter_view_quantizers: Dict[Tuple[Tuple[str, Callable, int], int],
+                                             Tuple[Tuple[nn.Module, str], int, Tuple[str,
+                                                                                     ...]],] = {}
         self.registered_parametrizations: List[Tuple[nn.Module, str]] = []
         self.parametrizations_removed = False
         self.enabled = False
@@ -274,6 +312,16 @@ class FunctionalQuantState:
     def quantizers(self) -> nn.ModuleDict:
         """Return the model-owned registry of prepared quantizer modules."""
         return getattr(self.model, _CONTAINER_NAME)
+
+    @property
+    def quantized_parameters(self) -> set[str]:
+        """Names of parameters quantized through owner parametrizations."""
+        names = set()
+        for name, _ in self.model.named_parameters():
+            if '.original' not in name:
+                continue
+            names.add(name.replace('parametrizations.', '').rsplit('.original', 1)[0])
+        return names
 
     def remove_parametrizations(self) -> None:
         """Remove functional weight parametrizations and restore original parameters."""
@@ -297,6 +345,7 @@ class FunctionalQuantState:
         if getattr(self.model, _STATE_NAME, None) is self:
             delattr(self.model, _STATE_NAME)
         self.calls.clear()
+        self.parameter_view_quantizers.clear()
         self._closed = True
 
     def _assert_open(self) -> None:
@@ -318,6 +367,9 @@ class _HookedMode(TorchFunctionMode):
         self.module_stack: List[Tuple[str, nn.Module]] = []
         self.counters = defaultdict(lambda: defaultdict(int))
         self.hooks: List[RemovableHandle] = []
+        self.parameter_owners: Dict[int, Tuple[nn.Module, str]] = {}
+        self.parameter_views: Dict[int, Tuple[weakref.ReferenceType, Any]] = {}
+        self.aliased_parameters = set()
 
     def _attach_hooks(self) -> None:
         """Attach hooks that maintain the active module stack and counters."""
@@ -336,6 +388,9 @@ class _HookedMode(TorchFunctionMode):
         self.hooks.clear()
         self.module_stack.clear()
         self.counters.clear()
+        self.parameter_views.clear()
+        self.parameter_owners.clear()
+        self.aliased_parameters.clear()
 
     def _pre_hook(self, name: str) -> Callable:
         """Create a pre-hook that resets and records each managed forward root."""
@@ -351,7 +406,6 @@ class _HookedMode(TorchFunctionMode):
         """Create an always-call hook that removes a completed module entry."""
 
         def hook(module: nn.Module, args: Tuple[Any, ...], output: Any) -> None:
-            """Perform this functional quantization operation."""
             if self.module_stack and self.module_stack[-1][0] == name:
                 self.module_stack.pop()
 
@@ -361,6 +415,93 @@ class _HookedMode(TorchFunctionMode):
         """Clear per-forward state after the top-level model invocation."""
         self.module_stack.clear()
         self.counters.clear()
+        self.parameter_views.clear()
+
+    def _view_for(self, value: Tensor) -> Any:
+        entry = self.parameter_views.get(id(value))
+        if entry is not None and entry[0]() is value:
+            return entry[1]
+        owner = self.parameter_owners.get(id(value))
+        if owner is not None:
+            return _ParameterView(owner)
+        base = getattr(value, '_base', None)
+        visited = set()
+        while base is not None and id(base) not in visited:
+            visited.add(id(base))
+            entry = self.parameter_views.get(id(base))
+            if entry is not None and entry[0]() is base:
+                return entry[1]
+            owner = self.parameter_owners.get(id(base))
+            if owner is not None:
+                return _ParameterView(owner, direct=False, reason='untracked parameter view')
+            base = getattr(base, '_base', None)
+        return None
+
+    def _record_view(self, value: Any, view: Any) -> None:
+        if isinstance(value, Tensor):
+            self.parameter_views[id(value)] = (weakref.ref(value), view)
+
+    def _resolve_view(self, value: Tensor) -> Optional[_ParameterView]:
+        """Resolve provenance and refresh owner identities after parameter replacement."""
+        view = self._view_for(value)
+        if isinstance(view, _ParameterView):
+            return view
+        base = value
+        visited = set()
+        while getattr(base, '_base', None) is not None and id(base) not in visited:
+            visited.add(id(base))
+            base = base._base
+        if isinstance(base, nn.Parameter):
+            self._build_parameter_owners()
+            view = self._resolve_view(value)
+            if isinstance(view, _ParameterView):
+                return view
+        return None
+
+    def _track_parameter_view(
+            self, func: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any],
+            output: Any) -> None:
+        """Propagate the deliberately small parameter-view subset we support."""
+        if not isinstance(output, Tensor) or not args or not isinstance(args[0], Tensor):
+            return
+        view = self._resolve_view(args[0])
+        if view is None:
+            return
+        if view.reason is not None:
+            self._record_view(output, view)
+            return
+        if func in _SELECT_FUNCTIONS:
+            index = args[1] if len(args) > 1 else kwargs.get('index')
+            if isinstance(index, tuple):
+                self._record_view(output, _ParameterView(view.owner, reason='tuple indexing'))
+                return
+            # MoE stores experts on one leading axis. Support scalar and vector
+            # indexing there; arbitrary indexing is intentionally rejected.
+            if (view.selector_dim is not None or isinstance(index, bool) or
+                    not isinstance(index, (int, Tensor))):
+                self._record_view(output, _ParameterView(view.owner, reason='unsupported indexing'))
+                return
+            self._record_view(
+                output, _ParameterView(view.owner, 0, index, view.transpose_last_two, direct=False))
+            return
+        if func in _TRANSPOSE_FUNCTIONS:
+            dim0 = args[1] if len(args) > 1 else kwargs.get('dim0')
+            dim1 = args[2] if len(args) > 2 else kwargs.get('dim1')
+            rank = args[0].dim()
+            dim0 = dim0 if dim0 >= 0 else rank + dim0
+            dim1 = dim1 if dim1 >= 0 else rank + dim1
+            if {dim0, dim1} == {rank - 2, rank - 1}:
+                self._record_view(
+                    output,
+                    _ParameterView(
+                        view.owner,
+                        view.selector_dim,
+                        view.selector,
+                        not view.transpose_last_two,
+                        direct=False))
+            else:
+                self._record_view(
+                    output, _ParameterView(view.owner, reason='unsupported transpose'))
 
     def _build_parameter_owners(self) -> None:
         """Map each direct model parameter to its owning module attribute."""
@@ -385,46 +526,11 @@ class _HookedMode(TorchFunctionMode):
                 self.parameter_owners[id(original)] = owner
 
     def _parameter_owner(self, value: Tensor) -> Tuple[Optional[Tuple[nn.Module, str]], bool]:
-        """Resolve a tensor to its registered parameter owner.
-
-        Direct parameters are matched by object identity. Tensor views are
-        matched by following their ``_base`` chain, which lets functional
-        quantization distinguish parameter-derived operands from ordinary
-        runtime tensors before applying activation-quantizer fallback. If a
-        parameter-like operand misses, the owner map is rebuilt to account for
-        parameters rematerialized or replaced by offload hooks.
-
-        Returns ``((owner_module, parameter_name), is_direct_parameter)`` on a
-        match, or ``(None, False)`` when the tensor is unrelated to a parameter.
-        """
-
-        def lookup():
-            owner = self.parameter_owners.get(id(value))
-            if owner is not None:
-                return owner, True
-            base = getattr(value, '_base', None)
-            visited = set()
-            while base is not None and id(base) not in visited:
-                visited.add(id(base))
-                owner = self.parameter_owners.get(id(base))
-                if owner is not None:
-                    return owner, False
-                base = getattr(base, '_base', None)
-            return None, False
-
-        owner, is_direct = lookup()
-        if owner is not None:
-            return owner, is_direct
-        base = value
-        visited = set()
-        while getattr(base, '_base', None) is not None and id(base) not in visited:
-            visited.add(id(base))
-            base = base._base
-        if not isinstance(base, nn.Parameter):
-            return None, False
-        # Offload hooks can replace or materialize a parameter after the initial map.
-        self._build_parameter_owners()
-        return lookup()
+        """Resolve an owner through the shared parameter-view provenance path."""
+        tracked = self._resolve_view(value)
+        if tracked is not None:
+            return tracked.owner, tracked.direct
+        return None, False
 
     def _spec_for(self, func: Callable, arg_idx: int, is_parameter: bool) -> Any:
         """Select the effective specification for an argument at a call site."""
@@ -475,14 +581,11 @@ class _FunctionalQuantBuilder(_HookedMode):
         super().__init__(state)
         self.discovered_calls: Dict[Tuple[str, Callable, int], Dict[int, _DiscoveredArgument]] = {}
         self.owner_plans: Dict[Tuple[nn.Module, str], _OwnerPlan] = {}
-        self.parameter_owners: Dict[int, Tuple[nn.Module, str]] = {}
-        self.aliased_parameters = set()
 
     def _owner_quant_kwargs(
             self,
-            value: Tensor,
             owner: Tuple[nn.Module, str],
-            is_direct_parameter: bool,
+            view: Optional[_ParameterView],
             di_kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
         """Validate and normalize owner-level weight quantizer configuration."""
         owner_di_kwargs = dict(di_kwargs)
@@ -491,24 +594,9 @@ class _FunctionalQuantBuilder(_HookedMode):
             return owner_di_kwargs, 'its owner attribute is not an unparametrized Parameter'
 
         required = ('output_channel_dim', 'group_dim')
-        if not is_direct_parameter:
-            rank_delta = owner_value.dim() - value.dim()
-            is_leading_index = rank_delta > 0 and tuple(value.shape) == tuple(
-                owner_value.shape[rank_delta:]) and tuple(value.stride()) == tuple(
-                    owner_value.stride()[rank_delta:])
-            is_last_two_transpose = False
-            if owner_value.dim() >= 2:
-                transposed_shape = (
-                    *owner_value.shape[:-2], owner_value.shape[-1], owner_value.shape[-2])
-                transposed_stride = (
-                    *owner_value.stride()[:-2], owner_value.stride()[-1], owner_value.stride()[-2])
-                is_last_two_transpose = (
-                    value.dim() == owner_value.dim() and tuple(value.shape) == transposed_shape and
-                    tuple(value.stride()) == transposed_stride and
-                    value.storage_offset() == owner_value.storage_offset())
-            if not is_leading_index and not is_last_two_transpose:
-                return owner_di_kwargs, (
-                    'only leading-index views and final-two-axis transpose views are supported')
+        if view is not None and view.reason is not None:
+            return owner_di_kwargs, view.reason
+        if view is not None and not view.direct:
             missing = [name for name in required if name not in owner_di_kwargs]
             if missing:
                 return owner_di_kwargs, (
@@ -543,8 +631,34 @@ class _FunctionalQuantBuilder(_HookedMode):
             self, name: str, module: nn.Module, func: Callable, index: int, arg_idx: int,
             value: Tensor) -> Optional[_DiscoveredArgument]:
         """Classify one operand and record any owner-level weight requirement."""
-        owner, is_direct_parameter = self._parameter_owner(value)
+        owner, _ = self._parameter_owner(value)
         spec = self._spec_for(func, arg_idx, owner is not None)
+        if isinstance(spec, ParameterViewQuant):
+            view = self._resolve_view(value)
+            is_grouped_owner = func is _grouped_mm_key and isinstance(view, _ParameterView)
+            if (not isinstance(view, _ParameterView) or view.reason is not None or
+                (view.selector_dim is None and not is_grouped_owner)):
+                warnings.warn(
+                    'ParameterViewQuant requires a supported selected parameter view.', UserWarning)
+                return None
+            if not isinstance(spec.quantizer, type):
+                raise TypeError('ParameterViewQuant.quantizer must be a quantizer class.')
+            selector_dim = spec.selector_dim
+            owner_value = getattr(view.owner[0], view.owner[1])
+            if selector_dim < 0:
+                selector_dim += owner_value.dim()
+            if not 0 <= selector_dim < owner_value.dim():
+                raise ValueError('ParameterViewQuant selector_dim is out of range.')
+            if view.selector_dim is not None and view.selector_dim != selector_dim:
+                raise ValueError(
+                    'ParameterViewQuant selector_dim does not match the indexed dimension.')
+            return _DiscoveredArgument(
+                quant_class=None,
+                di_kwargs=dict(spec.kwargs),
+                parameter_owner=view.owner,
+                parameter_view_quant=spec,
+                parameter_view_selector_dim=selector_dim,
+                example_device=value.device)
         quant_class, di_kwargs = _resolve_spec(spec, module, name, index)
         if quant_class is None:
             return None
@@ -553,9 +667,9 @@ class _FunctionalQuantBuilder(_HookedMode):
 
         fallback_spec = self._fallback_spec_for(func, arg_idx)
         fallback_quant_class, fallback_di_kwargs = _resolve_spec(fallback_spec, module, name, index)
-        owner_di_kwargs, error = self._owner_quant_kwargs(
-            value, owner, is_direct_parameter, di_kwargs)
-        owner_value = value if is_direct_parameter else getattr(owner[0], owner[1], None)
+        view = self._resolve_view(value)
+        owner_di_kwargs, error = self._owner_quant_kwargs(owner, view, di_kwargs)
+        owner_value = getattr(owner[0], owner[1], None)
         if id(owner_value) in self.aliased_parameters:
             error = 'tied parameters do not have a unique owner attribute'
         if is_parametrized(owner[0], owner[1]):
@@ -636,6 +750,36 @@ class _FunctionalQuantBuilder(_HookedMode):
             for arg_idx, argument in arguments.items():
                 if argument.parameter_owner is None:
                     continue
+                if argument.parameter_view_quant is not None:
+                    owner_module, owner_name = argument.parameter_owner
+                    owner = getattr(owner_module, owner_name)
+                    selector_dim = argument.parameter_view_selector_dim
+                    assert selector_dim is not None
+                    keys = []
+                    for selector in range(owner.shape[selector_dim]):
+                        selected = owner.select(selector_dim, selector)
+                        kwargs = dict(argument.parameter_view_quant.kwargs)
+                        for axis_name in ('output_channel_dim', 'group_dim'):
+                            if axis_name in kwargs:
+                                axis = kwargs[axis_name]
+                                if not isinstance(axis, int) or isinstance(axis, bool):
+                                    raise TypeError(f'{axis_name} must be an integer owner axis.')
+                                if axis < 0:
+                                    axis += owner.dim()
+                                if not 0 <= axis < owner.dim():
+                                    raise ValueError(f'{axis_name} is out of range.')
+                                if axis == selector_dim:
+                                    raise ValueError(
+                                        f'{axis_name} cannot be the selector dimension.')
+                                kwargs[axis_name] = axis if axis < selector_dim else axis - 1
+                        key = f'{_module_key(name, func, self.state.function_indices[func], index, arg_idx, True)}_expert_{selector}'
+                        proxy = self._create_weight(
+                            argument.parameter_view_quant.quantizer, kwargs, selected)
+                        self._add_quantizer(key, proxy)
+                        keys.append(key)
+                    self.state.parameter_view_quantizers[(call_key, arg_idx)] = (
+                        argument.parameter_owner, selector_dim, tuple(keys))
+                    continue
                 owner_plan = self.owner_plans[argument.parameter_owner]
                 if owner_plan.error is not None and argument.fallback_quant_class is not None:
                     key = _module_key(name, func, self.state.function_indices[func], index, arg_idx)
@@ -650,8 +794,8 @@ class _FunctionalQuantBuilder(_HookedMode):
             self, example_inputs: Optional[Tuple[Any, ...]],
             example_kwargs: Optional[Dict[str, Any]]) -> None:
         """Run one hooked preparation forward and reset transient counters."""
-        self._attach_hooks()
         try:
+            self._attach_hooks()
             with self, torch.no_grad():
                 self.model(*(example_inputs or ()), **(example_kwargs or {}))
         finally:
@@ -674,6 +818,10 @@ class _FunctionalQuantBuilder(_HookedMode):
             self, func: Callable, types: Tuple[Type, ...], args=(), kwargs=None) -> Any:
         """Create and apply quantizers while discovering each configured call."""
         kwargs = {} if kwargs is None else dict(kwargs)
+        if func in _SELECT_FUNCTIONS or func in _TRANSPOSE_FUNCTIONS:
+            output = func(*args, **kwargs)
+            self._track_parameter_view(func, args, kwargs, output)
+            return output
         canonical_func = _canonical_function(func)
         if canonical_func not in self.state.specs or not self.module_stack:
             return func(*args, **kwargs)
@@ -700,10 +848,15 @@ class functional_quantization_mode(_HookedMode):
 
     def __enter__(self) -> 'functional_quantization_mode':
         """Enable parametrizations, hooks, and torch-function interception."""
-        self._attach_hooks()
-        self._previous_enabled = self.state.enabled
-        self.state.enabled = self.enabled
-        return super().__enter__()
+        try:
+            self._attach_hooks()
+            self._build_parameter_owners()
+            self._previous_enabled = self.state.enabled
+            self.state.enabled = self.enabled
+            return super().__enter__()
+        except Exception:
+            self._remove_hooks()
+            raise
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
         """Restore mode state and remove hooks after the managed block exits."""
@@ -728,24 +881,34 @@ class functional_quantization_mode(_HookedMode):
         for arg_idx, value, _ in slots:
             if not isinstance(value, Tensor) or isinstance(value, QuantTensor):
                 continue
-            runtime_spec = self._spec_for(func, arg_idx, False)
-            runtime_quant, _ = _resolve_spec(runtime_spec, module, name, index)
-            if runtime_quant is not None:
+            view = self._resolve_view(value)
+            is_parameter = isinstance(view, _ParameterView)
+            spec = self._spec_for(func, arg_idx, is_parameter)
+            if isinstance(spec, ParameterViewQuant):
                 return False
-            base = value
-            while getattr(base, '_base', None) is not None:
-                base = base._base
-            if isinstance(base, nn.Parameter):
-                parameter_spec = self._spec_for(func, arg_idx, True)
-                parameter_quant, _ = _resolve_spec(parameter_spec, module, name, index)
-                if parameter_quant is not None:
-                    return False
+            quantizer, _ = _resolve_spec(spec, module, name, index)
+            if quantizer is not None:
+                return False
         return True
+
+    def _expert_bank(
+            self, owner: Tuple[nn.Module, str], selector_dim: int, keys: Tuple[str, ...]) -> Tensor:
+        """Materialize the independently quantized slices of one expert owner."""
+        parameter = getattr(owner[0], owner[1])
+        weights = [
+            _unpack_quant_tensor(self.state.quantizers[key](parameter.select(selector_dim, index)))
+            for index,
+            key in enumerate(keys)]
+        return torch.stack(weights, selector_dim)
 
     def __torch_function__(
             self, func: Callable, types: Tuple[Type, ...], args=(), kwargs=None) -> Any:
         """Route an intercepted call through its prepared argument quantizers."""
         kwargs = {} if kwargs is None else dict(kwargs)
+        if func in _SELECT_FUNCTIONS or func in _TRANSPOSE_FUNCTIONS:
+            output = func(*args, **kwargs)
+            self._track_parameter_view(func, args, kwargs, output)
+            return output
         canonical_func = _canonical_function(func)
         if not self.enabled or not self.state.enabled or canonical_func not in self.state.specs or not self.module_stack:
             return func(*args, **kwargs)
@@ -766,6 +929,44 @@ class functional_quantization_mode(_HookedMode):
             )
         slots, values = _logical_arguments(canonical_func, args, kwargs)
         for arg_idx, value, replace in slots:
+            selected = self.state.parameter_view_quantizers.get(
+                ((name, canonical_func, index), arg_idx))
+            if selected is not None:
+                owner, selector_dim, keys = selected
+                view = self._resolve_view(value)
+                if (not isinstance(view, _ParameterView) or view.reason is not None or
+                        view.owner != owner or
+                    (view.selector_dim is not None and view.selector_dim != selector_dim)):
+                    raise RuntimeError(
+                        'ParameterViewQuant operand no longer matches its prepared owner.')
+                if view.selector_dim is None:
+                    # Grouped-MM receives the full expert bank. Materialize the
+                    # independently quantized slices once and preserve its layout.
+                    value = self._expert_bank(owner, selector_dim, keys)
+                    if view.transpose_last_two:
+                        value = value.transpose(-2, -1)
+                    replace(value)
+                    continue
+                selector = view.selector
+                if isinstance(selector, Tensor):
+                    if selector.numel() == 1:
+                        selector = int(selector.item())
+                    else:
+                        bank = self._expert_bank(owner, selector_dim, keys)
+                        gathered = bank[selector]
+                        replace(gathered.transpose(-2, -1) if view.transpose_last_two else gathered)
+                        continue
+                selector = int(selector)
+                if selector < 0:
+                    selector += len(keys)
+                if not 0 <= selector < len(keys):
+                    raise RuntimeError('ParameterViewQuant selector is out of range.')
+                parameter = getattr(owner[0], owner[1])
+                quantized = self.state.quantizers[keys[selector]](
+                    parameter.select(selector_dim, selector))
+                quantized = _unpack_quant_tensor(quantized)
+                replace(quantized.transpose(-2, -1) if view.transpose_last_two else quantized)
+                continue
             prepared = call.arguments.get(arg_idx)
             if prepared is None or isinstance(value, QuantTensor) or not isinstance(value, Tensor):
                 continue
